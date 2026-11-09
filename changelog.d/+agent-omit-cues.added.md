@@ -1,0 +1,1 @@
+Agent: `-P omit_cues=...` removes named evaluation cues (call and step budgets, safety approvers, the hindsight question, required notes, operator feedback, trial wording) from the prompt, observations and tool schemas without changing what the harness enforces, and records the choice in the eval configuration.

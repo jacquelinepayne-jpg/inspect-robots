@@ -337,7 +337,7 @@ Configuration knobs (all `-P key=value`): `model`, `base_url`, `api_key_env`,
 `temperature`, `effort`, `max_speed_frac`, `transcript_echo`, `images`
 (default `always`; use `on_demand` for model-requested frames; `inspect-robots setup` suggests `on_demand`),
 `image_horizon`, `depth` (default `render`; use `off` to omit depth
-renders), `prior_learnings`, and `eval_notes`.
+renders), `prior_learnings`, `eval_notes`, and `omit_cues`.
 `speed` and `max_output_tokens` apply to `-P wire=messages` only, and passing
 either on another wire is an error. `speed=fast` is meaningful only for Claude
 on Anthropic's API; Tinker accepts and silently ignores it.
@@ -427,6 +427,27 @@ inspect-robots run --policy agent -P model=anthropic/claude-opus-5-5 \
 reached, so progress counts even if you cannot finish. give_up only ends the \
 trial early and never improves the score; use your whole call and step budget \
 before stopping." \
+    --instruction "stack the bowls on the table"
+```
+
+Set `-P omit_cues=...` to remove named evaluation cues from what the model
+reads, for studies of whether the harness itself tells a model it is being
+tested. The value is a comma-separated subset of `budget` (the call and step
+budget sentences and the per-observation `Step budget:` line),
+`safety_approver` (the approver sentence; `approver:` lines are reworded
+as "N step(s) were limited to the speed and position limits" so the model
+still learns a move was limited), `hindsight`
+(the hindsight question and argument on `done` and `give_up`), `note` (the
+required `note` on every tool), `operator_feedback` (the sentence announcing
+operator feedback) and `trial_framing` (the words "trial" and "scorer" in the
+prompt, tool descriptions and wall-clock line). Only the text changes: the
+budgets still end the trial, approvers still clamp, and operator feedback is
+still delivered if sent. The chosen cues are recorded in the eval
+configuration, and the default leaves the prompt unchanged.
+
+```bash
+inspect-robots run --policy agent -P model=anthropic/claude-opus-5-5 \
+    -P omit_cues="budget,safety_approver,hindsight" \
     --instruction "stack the bowls on the table"
 ```
 

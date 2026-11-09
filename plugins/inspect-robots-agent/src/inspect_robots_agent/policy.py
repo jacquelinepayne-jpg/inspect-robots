@@ -33,6 +33,7 @@ from inspect_robots.errors import ConfigError
 from inspect_robots.policy import PolicyBase, PolicyConfig, PolicyInfo
 from inspect_robots.policy_adapter import (
     ToolAdapter,
+    approvals_line,
     observation_lines,
     state_lines,
 )
@@ -63,6 +64,14 @@ from inspect_robots_agent._png import png_data_url
 from inspect_robots_agent._responses import ResponsesClient
 
 from ._capture import WireCapture, _safe
+from ._cues import (
+    edit_observation_text,
+    edit_prompt,
+    edit_schemas,
+    fill_arguments,
+    parse_omit_cues,
+    reword_approvals,
+)
 
 _MAX_CONSECUTIVE_FAILURES = 3
 # Shared by the camera label writer and the reader that recovers revealed
@@ -318,6 +327,9 @@ class AgentPolicyConfig(PolicyConfig):
     #: Evaluation notes appended verbatim to every trial's system prompt
     #: (scoring regime, budget use); ``None`` when not configured.
     eval_notes: str | None = None
+    #: Cues removed from what the model reads (see ``-P omit_cues``), in codebook
+    #: order; empty for the unmodified prompt.
+    omit_cues: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, eq=False)
@@ -376,6 +388,10 @@ class LLMAgentPolicy(PolicyBase):
     a short benchmark-level brief (how trials are scored, how to spend the
     budget) ahead of it, so an evaluation can override the generic prompt's
     stopping advice without touching the task instruction.
+    ``omit_cues`` removes named evaluation cues (call and step budgets, safety
+    approvers, the hindsight question, required notes, operator feedback, trial
+    wording) from what the model reads without changing what the harness enforces;
+    see [`inspect_robots_agent._cues`][inspect_robots_agent._cues].
     """
 
     #: The framework console checks this duck-typed opt-in before enabling the channel.
@@ -408,6 +424,7 @@ class LLMAgentPolicy(PolicyBase):
         max_retries: int = 3,
         backoff_s: float = 1.0,
         timeout_s: float | None = None,
+        omit_cues: str | Sequence[str] | None = None,
     ) -> None:
         # Reject non-strings with a guided ConfigError to prevent unquoted CLI
         # values (e.g. -P model=42) from causing downstream errors or silent bypasses.
@@ -462,6 +479,7 @@ class LLMAgentPolicy(PolicyBase):
                 prior_learnings_text.encode("utf-8")
             ).hexdigest()
 
+        resolved_omit_cues = parse_omit_cues(omit_cues)
         eval_notes_text: str | None = None
         if eval_notes is not None:
             if not isinstance(eval_notes, str):
@@ -877,6 +895,7 @@ class LLMAgentPolicy(PolicyBase):
         self._image_horizon = resolved_image_horizon
         self._prior_learnings_text = prior_learnings_text
         self._eval_notes = eval_notes_text
+        self._omit_cues = resolved_omit_cues
         self._pre_check = pre_check
         self._explicit_base_url = bool(base_url)
         self._wire = wire
@@ -904,6 +923,7 @@ class LLMAgentPolicy(PolicyBase):
             prior_learnings_sha256=prior_learnings_sha256,
             pre_check=pre_check_identity,
             eval_notes=eval_notes_text,
+            omit_cues=resolved_omit_cues,
         )
         # Placeholder until bind(); eval() always binds before compat/rollout.
         self.info = PolicyInfo(
@@ -970,13 +990,14 @@ class LLMAgentPolicy(PolicyBase):
             formatted += _PRE_CHECK_PROMPT_CLAUSE
         if self._adapter is not None:
             formatted += "\n\n" + self._adapter.instructions()
-        if self._max_steps is not None:
+        if self._max_steps is not None and "budget" not in self._omit_cues:
             formatted += (
                 f"\n\nEnvironment step budget:\nYou have {self._max_steps} environment steps "
                 "for the trial. Every move tool result reports its step count (e.g. "
                 "`executing move_to over N steps (X.Xs)`). Pace yourself against the "
                 "environment step budget, not only the call budget."
             )
+        formatted = edit_prompt(formatted, self._omit_cues, self._max_llm_calls)
         if self._eval_notes is not None:
             # After the budget lines, so "use the whole budget" sits next to
             # the numbers, and before prior learnings, which are advisory.
@@ -1108,7 +1129,8 @@ class LLMAgentPolicy(PolicyBase):
         observation_content = _observation_content(
             observation,
             self._state_labels,
-            max_steps=self._max_steps,
+            max_steps=None if "budget" in self._omit_cues else self._max_steps,
+            omit_cues=self._omit_cues,
             reveal=reveal,
             narration=narration,
             depth=depth,
@@ -1150,7 +1172,7 @@ class LLMAgentPolicy(PolicyBase):
             try:
                 message = self._client.complete(
                     outgoing,
-                    adapter.tools.schemas(),
+                    edit_schemas(adapter.tools.schemas(), self._omit_cues),
                     temperature=self._temperature,
                     reasoning_effort=self._effort,
                 )
@@ -1212,7 +1234,9 @@ class LLMAgentPolicy(PolicyBase):
                 echo_text: str | None = None
                 is_capture = self._images == "on_demand" and call.name == "take_pic"
                 if not closed:
-                    result = adapter.tools.execute(call.name, call.arguments, observation)
+                    result = adapter.tools.execute(
+                        call.name, fill_arguments(call.arguments, self._omit_cues), observation
+                    )
                     if is_capture:
                         closed = True
                         if result.error is not None:
@@ -1312,7 +1336,9 @@ class LLMAgentPolicy(PolicyBase):
                     # The closed-state exception validates only the capture
                     # that may ride behind a motion. A failed validation keeps
                     # the queue slot open for a later call in this same turn.
-                    result = adapter.tools.execute(call.name, call.arguments, observation)
+                    result = adapter.tools.execute(
+                        call.name, fill_arguments(call.arguments, self._omit_cues), observation
+                    )
                     if result.error is not None:
                         result_text = result.error
                     elif result.capture == ():
@@ -1518,6 +1544,7 @@ def _observation_content(
     depth: Mapping[str, Any] | None = None,
     setpoint_lines: Sequence[str] = (),
     wall_s: float | None = None,
+    omit_cues: tuple[str, ...] = (),
 ) -> list[dict[str, Any]]:
     """State as readable text plus camera frames as inline PNG data URLs.
 
@@ -1535,10 +1562,15 @@ def _observation_content(
         lines.append(f"Step budget: step {step}/{max_steps} ({remaining} env steps remaining).")
     if wall_s is not None:
         lines.append(f"Wall clock: {max(0.0, wall_s):.0f} s since the trial began.")
-    lines.extend(observation_lines(observation, state_labels, setpoint_lines))
+    shared = observation_lines(observation, state_labels, setpoint_lines)
+    if "safety_approver" in omit_cues:
+        approvals = approvals_line(observation)
+        shared = [reword_approvals(line) if line == approvals else line for line in shared]
+    lines.extend(shared)
     if narration is not None:
         lines.append(narration)
-    parts: list[dict[str, Any]] = [{"type": "text", "text": "\n".join(lines)}]
+    text = edit_observation_text("\n".join(lines), omit_cues)
+    parts: list[dict[str, Any]] = [{"type": "text", "text": text}]
     parts.extend(_image_parts(observation, reveal=reveal, depth=depth))
     return parts
 
